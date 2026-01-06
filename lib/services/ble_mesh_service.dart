@@ -41,9 +41,10 @@ const Duration MESSAGE_CACHE_EXPIRY = Duration(minutes: 5);
 const Duration PEER_TIMEOUT = Duration(seconds: 60);
 
 /// Maximum message length for BLE advertising (legacy limit is 31 bytes total)
-/// Structure: Type(1) + TTL(1) + MsgID(2) + SenderID(2) + Timestamp(4) + Payload
-/// Available for payload: 31 - 10 = ~21 bytes, but manufacturer data overhead is ~4 bytes
-const int MAX_MESSAGE_LENGTH = 15;
+/// Structure: Type(1) + TTL(1) + MsgID(2) + SenderID(2) + Timestamp(4) + Lat(4) + Lon(4) + Payload
+/// Header = 18 bytes, manufacturer data overhead = ~4 bytes
+/// Available for payload: 31 - 18 - 4 = ~9 bytes
+const int MAX_MESSAGE_LENGTH = 9;
 
 // ============================================================================
 // Enums
@@ -423,9 +424,11 @@ class BleMeshService extends ChangeNotifier {
   /// - Message ID: 2 bytes (hash)
   /// - Sender ID: 2 bytes (hash)
   /// - Timestamp: 4 bytes (seconds)
+  /// - Latitude: 4 bytes (float32)
+  /// - Longitude: 4 bytes (float32)
   /// - Payload: remaining bytes
   void _handleIncomingPacket(Uint8List data) {
-    if (data.length < 10) return; // Minimum: type + ttl + msgId(2) + senderId(2) + timestamp(4)
+    if (data.length < 18) return; // Minimum: header (18 bytes) without payload
 
     try {
       int offset = 0;
@@ -462,6 +465,18 @@ class BleMeshService extends ChangeNotifier {
       offset += 4;
       final timestamp = DateTime.fromMillisecondsSinceEpoch(timestampSecs * 1000);
 
+      // Parse 4-byte latitude (float32)
+      final latFloat = ByteData.sublistView(data, offset, offset + 4)
+          .getFloat32(0, Endian.big);
+      offset += 4;
+      final double? latitude = latFloat.isNaN ? null : latFloat;
+
+      // Parse 4-byte longitude (float32)
+      final lonFloat = ByteData.sublistView(data, offset, offset + 4)
+          .getFloat32(0, Endian.big);
+      offset += 4;
+      final double? longitude = lonFloat.isNaN ? null : lonFloat;
+
       // Calculate hop count
       final hopCount = DEFAULT_TTL - ttl;
 
@@ -473,7 +488,7 @@ class BleMeshService extends ChangeNotifier {
       peers[senderId]!.lastSeen = DateTime.now();
       peers[senderId]!.messagesReceived++;
 
-      // Parse payload
+      // Parse payload (text content only, coordinates are in header)
       final payload = data.sublist(offset);
       final content = utf8.decode(payload, allowMalformed: true);
 
@@ -481,9 +496,9 @@ class BleMeshService extends ChangeNotifier {
       if (type == MeshMessageType.message || type == MeshMessageType.sos) {
         totalMessagesReceived++;
 
-        final msg = MeshMessage.fromRawContent(
+        final msg = MeshMessage(
           id: messageId,
-          rawContent: content,
+          content: content,
           senderId: senderId,
           senderNickname: peers[senderId]?.nickname ?? "Peer-$senderId",
           timestamp: timestamp,
@@ -491,6 +506,8 @@ class BleMeshService extends ChangeNotifier {
           isMe: false,
           hopCount: hopCount,
           wasRelayed: hopCount > 0,
+          latitude: latitude,
+          longitude: longitude,
         );
 
         messages.add(msg);
@@ -551,8 +568,9 @@ class BleMeshService extends ChangeNotifier {
       return;
     }
 
-    // Get current location if available
-    String locationStr = "";
+    // Get current location if available (binary encoding in packet header)
+    double? latitude;
+    double? longitude;
     try {
       Position? position = await Geolocator.getLastKnownPosition();
       if (position == null) {
@@ -561,21 +579,19 @@ class BleMeshService extends ChangeNotifier {
         ).timeout(const Duration(seconds: 5));
       }
       if (position != null) {
-        locationStr =
-            "${position.latitude.toStringAsFixed(5)},"
-            "${position.longitude.toStringAsFixed(5)}";
+        latitude = position.latitude;
+        longitude = position.longitude;
       }
     } catch (e) {
       debugPrint("Could not get location: $e");
     }
 
-    // Format message with location
-    final messageToSend = locationStr.isNotEmpty ? "$text|$locationStr|" : text;
-
-    // Build packet
+    // Build packet with binary coordinates (not in text payload)
     final packet = _buildPacket(
       type: MeshMessageType.message,
-      content: messageToSend,
+      content: text,
+      latitude: latitude,
+      longitude: longitude,
     );
 
     // Broadcast
@@ -584,14 +600,16 @@ class BleMeshService extends ChangeNotifier {
 
     // Add to local messages
     final messageId = const Uuid().v4();
-    final msg = MeshMessage.fromRawContent(
+    final msg = MeshMessage(
       id: messageId,
-      rawContent: messageToSend,
+      content: text,
       senderId: _peerId!,
       senderNickname: "Me",
       timestamp: DateTime.now(),
       type: MeshMessageType.message,
       isMe: true,
+      latitude: latitude,
+      longitude: longitude,
     );
     messages.add(msg);
     _messageController.add(msg);
@@ -611,17 +629,21 @@ class BleMeshService extends ChangeNotifier {
 
   /// Build a mesh packet with compact format
   /// 
-  /// Packet structure (max 24 bytes for manufacturer data):
+  /// Packet structure (max ~27 bytes for manufacturer data):
   /// - Type: 1 byte
   /// - TTL: 1 byte
   /// - Message ID: 2 bytes (hash of UUID)
   /// - Sender ID: 2 bytes (hash of peer ID)
   /// - Timestamp: 4 bytes (seconds since epoch, truncated)
-  /// - Payload: remaining bytes (up to ~14 bytes)
+  /// - Latitude: 4 bytes (float32) - 0x7FC00000 if not available (NaN)
+  /// - Longitude: 4 bytes (float32) - 0x7FC00000 if not available (NaN)
+  /// - Payload: remaining bytes (~9 bytes for text)
   Uint8List _buildPacket({
     required MeshMessageType type,
     required String content,
     int ttl = DEFAULT_TTL,
+    double? latitude,
+    double? longitude,
   }) {
     final messageId = const Uuid().v4();
     
@@ -653,7 +675,17 @@ class BleMeshService extends ChangeNotifier {
     ByteData.view(tsBytes.buffer).setUint32(0, timestampSecs, Endian.big);
     builder.add(tsBytes);                                   // 4 bytes
     
-    builder.add(contentBytes);                              // up to 14 bytes
+    // 4-byte latitude (float32) - NaN if not available
+    final latBytes = Uint8List(4);
+    ByteData.view(latBytes.buffer).setFloat32(0, latitude ?? double.nan, Endian.big);
+    builder.add(latBytes);                                  // 4 bytes
+    
+    // 4-byte longitude (float32) - NaN if not available
+    final lonBytes = Uint8List(4);
+    ByteData.view(lonBytes.buffer).setFloat32(0, longitude ?? double.nan, Endian.big);
+    builder.add(lonBytes);                                  // 4 bytes
+    
+    builder.add(contentBytes);                              // up to 9 bytes
 
     // Mark as processed using full messageId for local dedup
     _processedMessageIds[messageId] = DateTime.now();
