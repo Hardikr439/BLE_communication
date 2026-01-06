@@ -2,12 +2,17 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'pages/sos_page.dart';
 import 'pages/ble_mesh_chat_page.dart';
+import 'pages/profile_page.dart';
+import 'pages/friends_page.dart';
+import 'pages/private_chat_page.dart';
+import 'models/friend.dart';
 
 /// BLE Mesh App
 ///
 /// A Flutter application for BLE mesh networking with:
 /// - SOS Emergency Button (broadcasts location via BLE)
 /// - BLE Mesh Chat (offline communication via Bluetooth)
+/// - Friend-based private messaging
 ///
 /// Works without internet connection using Bluetooth Low Energy.
 void main() {
@@ -80,6 +85,18 @@ class BLEMeshApp extends StatelessWidget {
         '/': (context) => const HomePage(),
         '/sos': (context) => const SosPage(),
         '/mesh_chat': (context) => const BleMeshChatPage(),
+        '/profile': (context) => const ProfilePage(),
+        '/friends': (context) => const FriendsPage(),
+      },
+      onGenerateRoute: (settings) {
+        // Handle private chat route with Friend argument
+        if (settings.name == '/chat') {
+          final friend = settings.arguments as Friend;
+          return MaterialPageRoute(
+            builder: (context) => PrivateChatPage(friend: friend),
+          );
+        }
+        return null;
       },
     );
   }
@@ -146,16 +163,31 @@ class HomePage extends StatelessWidget {
                   // Mesh Chat Card
                   _buildFeatureCard(
                     context,
-                    icon: Icons.chat_bubble_outline,
+                    icon: Icons.people_outline,
                     iconColor: Colors.white,
                     iconBgColor: primaryBlue,
-                    title: 'Mesh Chat',
+                    title: 'Friends & Chat',
                     description:
-                        'Send messages to nearby devices via Bluetooth. Multi-hop relay for extended range.',
-                    buttonText: 'Start Chat',
+                        'Message friends via Bluetooth mesh. Add friends using their code and chat when nearby.',
+                    buttonText: 'Open Friends',
                     buttonColor: primaryBlue,
-                    onPressed: () =>
-                        Navigator.pushNamed(context, '/mesh_chat'),
+                    onPressed: () => Navigator.pushNamed(context, '/friends'),
+                  ),
+
+                  const SizedBox(height: 16),
+
+                  // Profile Card
+                  _buildFeatureCard(
+                    context,
+                    icon: Icons.person_outline,
+                    iconColor: Colors.white,
+                    iconBgColor: const Color(0xFF9B59B6),
+                    title: 'My Profile',
+                    description:
+                        'Set your username and view your friend code for others to add you.',
+                    buttonText: 'View Profile',
+                    buttonColor: const Color(0xFF9B59B6),
+                    onPressed: () => Navigator.pushNamed(context, '/profile'),
                   ),
                 ],
               ),

@@ -52,11 +52,17 @@ const int MAX_MESSAGE_LENGTH = 9;
 
 /// Types of messages in the mesh network
 enum MeshMessageType {
-  /// Peer announcement (nickname broadcast)
+  /// Peer announcement (nickname + friend code broadcast)
   announce(0x01),
 
-  /// Regular chat message
+  /// Friend request (when someone adds you)
+  friendRequest(0x02),
+
+  /// Regular chat message (broadcast)
   message(0x04),
+
+  /// Direct message (to specific friend)
+  direct(0x08),
 
   /// SOS emergency message
   sos(0x10),
@@ -114,6 +120,7 @@ class MeshMessage {
   final double? latitude;
   final double? longitude;
   final String? emotion;
+  final String? targetId; // For direct messages
 
   MeshMessage({
     required this.id,
@@ -128,6 +135,7 @@ class MeshMessage {
     this.latitude,
     this.longitude,
     this.emotion,
+    this.targetId,
   });
 
   /// Parse location and emotion from message content
@@ -228,6 +236,9 @@ class BleMeshService extends ChangeNotifier {
   /// Known peers in the network
   final Map<String, MeshPeer> peers = {};
 
+  /// Peer ID to Friend Code mapping (discovered via announcements)
+  final Map<String, String> _peerFriendCodes = {};
+
   /// All received/sent messages
   final List<MeshMessage> messages = [];
 
@@ -261,12 +272,32 @@ class BleMeshService extends ChangeNotifier {
   // -------------------------------------------------------------------------
 
   final _messageController = StreamController<MeshMessage>.broadcast();
+  final _directMessageController = StreamController<MeshMessage>.broadcast();
+  final _peerDiscoveryController = StreamController<MeshPeer>.broadcast();
+  final _friendCodeDiscoveryController =
+      StreamController<MapEntry<String, String>>.broadcast();
+  final _friendRequestController =
+      StreamController<MapEntry<String, String>>.broadcast();
   final _statusController = StreamController<String>.broadcast();
   final _errorController = StreamController<String>.broadcast();
 
   Stream<MeshMessage> get messageStream => _messageController.stream;
+  Stream<MeshMessage> get directMessageStream =>
+      _directMessageController.stream;
+  Stream<MeshPeer> get peerDiscoveryStream => _peerDiscoveryController.stream;
+
+  /// Stream of (peerId, friendCode) when a peer announces their friend code
+  Stream<MapEntry<String, String>> get friendCodeDiscoveryStream =>
+      _friendCodeDiscoveryController.stream;
+
+  /// Stream of (nickname, friendCode) when someone sends us a friend request
+  Stream<MapEntry<String, String>> get friendRequestStream =>
+      _friendRequestController.stream;
   Stream<String> get statusStream => _statusController.stream;
   Stream<String> get errorStream => _errorController.stream;
+
+  /// Get friend code for a peer (if discovered via announcement)
+  String? getFriendCodeForPeer(String peerId) => _peerFriendCodes[peerId];
 
   // =========================================================================
   // Initialization
@@ -417,8 +448,10 @@ class BleMeshService extends ChangeNotifier {
   // =========================================================================
 
   /// Process incoming mesh packet (compact format)
-  /// 
-  /// Packet structure:
+  ///
+  /// Packet structures:
+  ///
+  /// Broadcast (message/sos/announce):
   /// - Type: 1 byte
   /// - TTL: 1 byte
   /// - Message ID: 2 bytes (hash)
@@ -427,8 +460,17 @@ class BleMeshService extends ChangeNotifier {
   /// - Latitude: 4 bytes (float32)
   /// - Longitude: 4 bytes (float32)
   /// - Payload: remaining bytes
+  ///
+  /// Direct message:
+  /// - Type: 1 byte (0x08)
+  /// - TTL: 1 byte
+  /// - Message ID: 2 bytes (hash)
+  /// - Sender ID: 2 bytes (hash)
+  /// - Target ID: 2 bytes (hash of friend code)
+  /// - Timestamp: 4 bytes (seconds)
+  /// - Payload: remaining bytes
   void _handleIncomingPacket(Uint8List data) {
-    if (data.length < 18) return; // Minimum: header (18 bytes) without payload
+    if (data.length < 12) return; // Minimum header size
 
     try {
       int offset = 0;
@@ -459,34 +501,59 @@ class BleMeshService extends ChangeNotifier {
       final myIdHash = _hashTo2Bytes(_peerId!);
       if (senderIdHash == myIdHash) return;
 
+      // Handle direct messages and friend requests (same packet format)
+      if (type == MeshMessageType.direct ||
+          type == MeshMessageType.friendRequest) {
+        _handleDirectPacket(data, offset, messageId, senderId, ttl, type);
+        return;
+      }
+
       // Parse 4-byte timestamp (seconds)
-      final timestampSecs = ByteData.sublistView(data, offset, offset + 4)
-          .getUint32(0, Endian.big);
+      final timestampSecs = ByteData.sublistView(
+        data,
+        offset,
+        offset + 4,
+      ).getUint32(0, Endian.big);
       offset += 4;
-      final timestamp = DateTime.fromMillisecondsSinceEpoch(timestampSecs * 1000);
+      final timestamp = DateTime.fromMillisecondsSinceEpoch(
+        timestampSecs * 1000,
+      );
 
       // Parse 4-byte latitude (float32)
-      final latFloat = ByteData.sublistView(data, offset, offset + 4)
-          .getFloat32(0, Endian.big);
+      final latFloat = ByteData.sublistView(
+        data,
+        offset,
+        offset + 4,
+      ).getFloat32(0, Endian.big);
       offset += 4;
       final double? latitude = latFloat.isNaN ? null : latFloat;
 
       // Parse 4-byte longitude (float32)
-      final lonFloat = ByteData.sublistView(data, offset, offset + 4)
-          .getFloat32(0, Endian.big);
+      final lonFloat = ByteData.sublistView(
+        data,
+        offset,
+        offset + 4,
+      ).getFloat32(0, Endian.big);
       offset += 4;
       final double? longitude = lonFloat.isNaN ? null : lonFloat;
 
       // Calculate hop count
       final hopCount = DEFAULT_TTL - ttl;
 
-      // Update or create peer
-      if (!peers.containsKey(senderId)) {
+      // Update or create peer and emit discovery event
+      final isNewPeer = !peers.containsKey(senderId);
+      if (isNewPeer) {
         peers[senderId] = MeshPeer(id: senderId);
-        notifyListeners();
       }
       peers[senderId]!.lastSeen = DateTime.now();
       peers[senderId]!.messagesReceived++;
+
+      // Emit peer discovery for friend status updates
+      _peerDiscoveryController.add(peers[senderId]!);
+
+      if (isNewPeer) {
+        notifyListeners();
+      }
 
       // Parse payload (text content only, coordinates are in header)
       final payload = data.sublist(offset);
@@ -519,7 +586,33 @@ class BleMeshService extends ChangeNotifier {
           _scheduleRelay(data, ttl, messageId);
         }
       } else if (type == MeshMessageType.announce) {
-        peers[senderId]?.nickname = content;
+        // Parse announcement: "nickname|friendcode"
+        String nickname = content;
+        String? friendCode;
+
+        if (content.contains('|')) {
+          final parts = content.split('|');
+          nickname = parts[0];
+          if (parts.length > 1) {
+            friendCode = parts[1];
+          }
+        }
+
+        // Update peer info
+        final peer = peers[senderId];
+        if (peer != null) {
+          peer.nickname = nickname;
+          if (friendCode != null) {
+            // Store friend code in a field we can use for matching
+            _peerFriendCodes[senderId] = friendCode;
+          }
+        }
+
+        // Emit peer discovery with friend code info
+        if (friendCode != null) {
+          _friendCodeDiscoveryController.add(MapEntry(senderId, friendCode));
+        }
+
         notifyListeners();
 
         // Relay announcements too
@@ -530,6 +623,123 @@ class BleMeshService extends ChangeNotifier {
     } catch (e) {
       debugPrint("Error handling packet: $e");
     }
+  }
+
+  /// Handle incoming direct message or friend request packet
+  ///
+  /// Direct messages are relayed through the mesh but only processed
+  /// by the target recipient (compared via hash)
+  void _handleDirectPacket(
+    Uint8List data,
+    int offset,
+    String messageId,
+    String senderId,
+    int ttl,
+    MeshMessageType type,
+  ) {
+    try {
+      // Parse 2-byte target ID hash
+      final targetIdHash = (data[offset] << 8) | data[offset + 1];
+      offset += 2;
+
+      // Parse 4-byte timestamp (seconds)
+      final timestampSecs = ByteData.sublistView(
+        data,
+        offset,
+        offset + 4,
+      ).getUint32(0, Endian.big);
+      offset += 4;
+      final timestamp = DateTime.fromMillisecondsSinceEpoch(
+        timestampSecs * 1000,
+      );
+
+      // Parse payload
+      final payload = data.sublist(offset);
+      final content = utf8.decode(payload, allowMalformed: true);
+
+      // Calculate hop count
+      final hopCount = DEFAULT_TTL - ttl;
+
+      // Update or create peer
+      final isNewPeer = !peers.containsKey(senderId);
+      if (isNewPeer) {
+        peers[senderId] = MeshPeer(id: senderId);
+      }
+      peers[senderId]!.lastSeen = DateTime.now();
+      peers[senderId]!.messagesReceived++;
+      _peerDiscoveryController.add(peers[senderId]!);
+
+      if (isNewPeer) {
+        notifyListeners();
+      }
+
+      // Check if this message is for us
+      final myFriendCodeHash = _hashTo2Bytes(_generateFriendCode(_peerId!));
+      final isForMe = targetIdHash == myFriendCodeHash;
+
+      if (isForMe) {
+        if (type == MeshMessageType.friendRequest) {
+          // Parse friend request: "nickname|friendCode"
+          String senderNickname = content;
+          String? senderFriendCode;
+
+          if (content.contains('|')) {
+            final parts = content.split('|');
+            senderNickname = parts[0];
+            if (parts.length > 1) {
+              senderFriendCode = parts[1];
+            }
+          }
+
+          // Emit friend request event for auto-add
+          if (senderFriendCode != null) {
+            _friendRequestController.add(
+              MapEntry(senderNickname, senderFriendCode),
+            );
+
+            // Also store this peer's friend code
+            _peerFriendCodes[senderId] = senderFriendCode;
+            peers[senderId]?.nickname = senderNickname;
+          }
+        } else {
+          // Regular direct message
+          totalMessagesReceived++;
+
+          final msg = MeshMessage(
+            id: messageId,
+            content: content,
+            senderId: senderId,
+            senderNickname: peers[senderId]?.nickname ?? "Peer-$senderId",
+            timestamp: timestamp,
+            type: MeshMessageType.direct,
+            isMe: false,
+            hopCount: hopCount,
+            wasRelayed: hopCount > 0,
+            targetId: _generateFriendCode(_peerId!),
+          );
+
+          // Add to direct message stream for FriendService to handle
+          _directMessageController.add(msg);
+        }
+        notifyListeners();
+      }
+
+      // Always relay direct messages and friend requests (even if not for us)
+      if (ttl > 0) {
+        _scheduleRelay(data, ttl, messageId);
+      }
+    } catch (e) {
+      debugPrint("Error handling direct packet: $e");
+    }
+  }
+
+  /// Generate friend code from peer ID (same algorithm as FriendService)
+  String _generateFriendCode(String peerId) {
+    // Use first 3 chars of hex hash + last 3 digits
+    final hash = _hashTo2Bytes(
+      peerId,
+    ).toRadixString(16).padLeft(4, '0').toUpperCase();
+    return '${hash.substring(0, 3)}-${hash.substring(1, 4)}';
   }
 
   /// Schedule a message for relay
@@ -616,19 +826,121 @@ class BleMeshService extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Send a direct message to a specific friend
+  ///
+  /// The targetFriendCode is included in the packet so only the target
+  /// can read it (though others will relay it)
+  Future<void> sendDirectMessage(
+    String text, {
+    required String targetFriendCode,
+  }) async {
+    if (_peerId == null) {
+      _errorController.add("Service not initialized");
+      return;
+    }
+
+    // Build packet with target ID
+    final packet = _buildDirectPacket(
+      type: MeshMessageType.direct,
+      content: text,
+      targetFriendCode: targetFriendCode,
+    );
+
+    // Broadcast (mesh will relay, but only target processes)
+    await _broadcast(packet);
+    totalMessagesSent++;
+    notifyListeners();
+  }
+
+  /// Build a direct message packet
+  ///
+  /// Packet structure (compact, for direct messages):
+  /// - Type: 1 byte (0x08 for direct)
+  /// - TTL: 1 byte
+  /// - Message ID: 2 bytes (hash)
+  /// - Sender ID: 2 bytes (hash)
+  /// - Target ID: 2 bytes (hash of friend code)
+  /// - Timestamp: 4 bytes
+  /// - Payload: remaining bytes
+  Uint8List _buildDirectPacket({
+    required MeshMessageType type,
+    required String content,
+    required String targetFriendCode,
+    int ttl = DEFAULT_TTL,
+  }) {
+    final messageId = const Uuid().v4();
+
+    final msgIdHash = _hashTo2Bytes(messageId);
+    final senderIdHash = _hashTo2Bytes(_peerId!);
+    final targetIdHash = _hashTo2Bytes(targetFriendCode);
+    final timestampSecs = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+
+    // More space for text since no lat/lon
+    var contentBytes = utf8.encode(content);
+    if (contentBytes.length > 17) {
+      // 31 - 14 (header) = 17 bytes for payload
+      contentBytes = contentBytes.sublist(0, 17);
+    }
+
+    final builder = BytesBuilder();
+    builder.addByte(type.value); // 1 byte
+    builder.addByte(ttl); // 1 byte
+    builder.addByte((msgIdHash >> 8) & 0xFF); // 1 byte
+    builder.addByte(msgIdHash & 0xFF); // 1 byte
+    builder.addByte((senderIdHash >> 8) & 0xFF); // 1 byte
+    builder.addByte(senderIdHash & 0xFF); // 1 byte
+    builder.addByte((targetIdHash >> 8) & 0xFF); // 1 byte (target high)
+    builder.addByte(targetIdHash & 0xFF); // 1 byte (target low)
+
+    // 4-byte timestamp
+    final tsBytes = Uint8List(4);
+    ByteData.view(tsBytes.buffer).setUint32(0, timestampSecs, Endian.big);
+    builder.add(tsBytes); // 4 bytes
+
+    builder.add(contentBytes); // up to 17 bytes
+
+    // Mark as processed
+    _processedMessageIds[messageId] = DateTime.now();
+    _processedMessageIds['h:$msgIdHash'] = DateTime.now();
+
+    return builder.toBytes();
+  }
+
   /// Announce presence in the mesh network
+  /// Includes friend code so others can identify us
   Future<void> announcePresence() async {
     if (_peerId == null || _nickname == null) return;
 
+    // Include friend code in announcement: "nickname|friendcode"
+    final friendCode = _generateFriendCode(_peerId!);
+    final content = '$_nickname|$friendCode';
+
     final packet = _buildPacket(
       type: MeshMessageType.announce,
-      content: _nickname!,
+      content: content,
+    );
+    await _broadcast(packet);
+  }
+
+  /// Broadcast a friend request to a specific user
+  /// Called when you add someone as a friend
+  Future<void> broadcastFriendRequest(String targetFriendCode) async {
+    if (_peerId == null || _nickname == null) return;
+
+    // Content: "myNickname|myFriendCode"
+    final myFriendCode = _generateFriendCode(_peerId!);
+    final content = '$_nickname|$myFriendCode';
+
+    final packet = _buildDirectPacket(
+      type: MeshMessageType.friendRequest,
+      content: content,
+      targetFriendCode: targetFriendCode,
     );
     await _broadcast(packet);
   }
 
   /// Build a mesh packet with compact format
-  /// 
+  ///
   /// Packet structure (max ~27 bytes for manufacturer data):
   /// - Type: 1 byte
   /// - TTL: 1 byte
@@ -646,13 +958,13 @@ class BleMeshService extends ChangeNotifier {
     double? longitude,
   }) {
     final messageId = const Uuid().v4();
-    
+
     // Hash the UUID to 2 bytes for compactness
     final msgIdHash = _hashTo2Bytes(messageId);
-    
+
     // Hash sender ID to 2 bytes
     final senderIdHash = _hashTo2Bytes(_peerId!);
-    
+
     // Timestamp as 4-byte seconds (good until year 2106)
     final timestampSecs = DateTime.now().millisecondsSinceEpoch ~/ 1000;
 
@@ -663,29 +975,33 @@ class BleMeshService extends ChangeNotifier {
     }
 
     final builder = BytesBuilder();
-    builder.addByte(type.value);                           // 1 byte
-    builder.addByte(ttl);                                  // 1 byte
-    builder.addByte((msgIdHash >> 8) & 0xFF);              // 1 byte (msg ID high)
-    builder.addByte(msgIdHash & 0xFF);                     // 1 byte (msg ID low)
-    builder.addByte((senderIdHash >> 8) & 0xFF);           // 1 byte (sender high)
-    builder.addByte(senderIdHash & 0xFF);                  // 1 byte (sender low)
-    
+    builder.addByte(type.value); // 1 byte
+    builder.addByte(ttl); // 1 byte
+    builder.addByte((msgIdHash >> 8) & 0xFF); // 1 byte (msg ID high)
+    builder.addByte(msgIdHash & 0xFF); // 1 byte (msg ID low)
+    builder.addByte((senderIdHash >> 8) & 0xFF); // 1 byte (sender high)
+    builder.addByte(senderIdHash & 0xFF); // 1 byte (sender low)
+
     // 4-byte timestamp
     final tsBytes = Uint8List(4);
     ByteData.view(tsBytes.buffer).setUint32(0, timestampSecs, Endian.big);
-    builder.add(tsBytes);                                   // 4 bytes
-    
+    builder.add(tsBytes); // 4 bytes
+
     // 4-byte latitude (float32) - NaN if not available
     final latBytes = Uint8List(4);
-    ByteData.view(latBytes.buffer).setFloat32(0, latitude ?? double.nan, Endian.big);
-    builder.add(latBytes);                                  // 4 bytes
-    
+    ByteData.view(
+      latBytes.buffer,
+    ).setFloat32(0, latitude ?? double.nan, Endian.big);
+    builder.add(latBytes); // 4 bytes
+
     // 4-byte longitude (float32) - NaN if not available
     final lonBytes = Uint8List(4);
-    ByteData.view(lonBytes.buffer).setFloat32(0, longitude ?? double.nan, Endian.big);
-    builder.add(lonBytes);                                  // 4 bytes
-    
-    builder.add(contentBytes);                              // up to 9 bytes
+    ByteData.view(
+      lonBytes.buffer,
+    ).setFloat32(0, longitude ?? double.nan, Endian.big);
+    builder.add(lonBytes); // 4 bytes
+
+    builder.add(contentBytes); // up to 9 bytes
 
     // Mark as processed using full messageId for local dedup
     _processedMessageIds[messageId] = DateTime.now();
@@ -694,7 +1010,7 @@ class BleMeshService extends ChangeNotifier {
 
     return builder.toBytes();
   }
-  
+
   /// Hash a string to a 2-byte integer for compact transmission
   int _hashTo2Bytes(String input) {
     int hash = 0;
@@ -706,14 +1022,24 @@ class BleMeshService extends ChangeNotifier {
 
   /// Broadcast a packet via BLE advertising
   Future<void> _broadcast(Uint8List packet) async {
-    if (_advertisingBusy) return;
+    // Skip if already broadcasting (prevents race conditions)
+    if (_advertisingBusy) {
+      debugPrint("Skipping broadcast - already busy");
+      return;
+    }
     _advertisingBusy = true;
 
     try {
-      // Stop existing advertising
+      // Stop existing advertising first if running
       if (_isAdvertising) {
-        await _blePeripheral.stop();
-        await Future.delayed(const Duration(milliseconds: 100));
+        try {
+          await _blePeripheral.stop();
+          _isAdvertising = false;
+        } catch (e) {
+          debugPrint("Error stopping previous broadcast: $e");
+        }
+        // Wait for peripheral to fully stop
+        await Future.delayed(const Duration(milliseconds: 150));
       }
 
       final advertiseData = AdvertiseData(
@@ -726,23 +1052,23 @@ class BleMeshService extends ChangeNotifier {
       _isAdvertising = true;
       _statusController.add("Broadcasting...");
 
-      // Stop after 3 seconds
-      Timer(const Duration(seconds: 3), () async {
-        if (_isAdvertising) {
-          try {
-            await _blePeripheral.stop();
-            _isAdvertising = false;
-            _statusController.add("Ready");
-          } catch (e) {
-            debugPrint("Error stopping broadcast: $e");
-          }
+      // Schedule stop after 2 seconds (shorter than the 5s interval)
+      await Future.delayed(const Duration(seconds: 2));
+      
+      if (_isAdvertising) {
+        try {
+          await _blePeripheral.stop();
+          _isAdvertising = false;
+          _statusController.add("Ready");
+        } catch (e) {
+          debugPrint("Error stopping broadcast: $e");
         }
-        _advertisingBusy = false;
-      });
+      }
     } catch (e) {
-      _advertisingBusy = false;
       _isAdvertising = false;
       _errorController.add("Broadcast failed: $e");
+    } finally {
+      _advertisingBusy = false;
     }
   }
 
@@ -763,8 +1089,9 @@ class BleMeshService extends ChangeNotifier {
       _processRelayQueue();
     });
 
-    // Periodic announcements every 30 seconds
-    _announcementTimer = Timer.periodic(const Duration(seconds: 30), (_) {
+      // Periodic announcements every 5 seconds for friend presence detection
+    // (2s broadcast + 3s gap to avoid race conditions)
+    _announcementTimer = Timer.periodic(const Duration(seconds: 5), (_) {
       announcePresence();
     });
   }
@@ -900,6 +1227,10 @@ class BleMeshService extends ChangeNotifier {
     }
 
     _messageController.close();
+    _directMessageController.close();
+    _peerDiscoveryController.close();
+    _friendCodeDiscoveryController.close();
+    _friendRequestController.close();
     _statusController.close();
     _errorController.close();
   }
