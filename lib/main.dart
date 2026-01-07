@@ -5,6 +5,7 @@ import 'pages/ble_mesh_chat_page.dart';
 import 'pages/profile_page.dart';
 import 'pages/friends_page.dart';
 import 'pages/private_chat_page.dart';
+import 'pages/debug_panel_page.dart';
 import 'models/friend.dart';
 
 /// BLE Mesh App
@@ -87,6 +88,7 @@ class BLEMeshApp extends StatelessWidget {
         '/mesh_chat': (context) => const BleMeshChatPage(),
         '/profile': (context) => const ProfilePage(),
         '/friends': (context) => const FriendsPage(),
+        '/debug': (context) => const DebugPanelPage(),
       },
       onGenerateRoute: (settings) {
         // Handle private chat route with Friend argument
@@ -188,6 +190,22 @@ class HomePage extends StatelessWidget {
                     buttonText: 'View Profile',
                     buttonColor: const Color(0xFF9B59B6),
                     onPressed: () => Navigator.pushNamed(context, '/profile'),
+                  ),
+
+                  const SizedBox(height: 16),
+
+                  // Debug Panel Card
+                  _buildFeatureCard(
+                    context,
+                    icon: Icons.bug_report,
+                    iconColor: Colors.white,
+                    iconBgColor: Colors.grey[700]!,
+                    title: 'Debug Panel',
+                    description:
+                        'View raw BLE packets, peer discovery, and mesh diagnostics.',
+                    buttonText: 'Open Debug',
+                    buttonColor: Colors.grey[700]!,
+                    onPressed: () => Navigator.pushNamed(context, '/debug'),
                   ),
                 ],
               ),

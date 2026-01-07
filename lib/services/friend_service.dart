@@ -42,6 +42,7 @@ class FriendService extends ChangeNotifier {
   // Subscriptions
   StreamSubscription? _friendCodeDiscoverySubscription;
   StreamSubscription? _friendRequestSubscription;
+  StreamSubscription? _peerDiscoverySubscription;
   Timer? _staleCheckTimer;
 
   // Getters
@@ -110,14 +111,20 @@ class FriendService extends ChangeNotifier {
   void _setupMeshListeners() {
     final meshService = BleMeshService.instance;
 
+    debugPrint('Setting up mesh listeners for friend service');
+
     // Listen for friend code discoveries (from announcements)
+    _friendCodeDiscoverySubscription?.cancel();
     _friendCodeDiscoverySubscription = meshService.friendCodeDiscoveryStream
         .listen((entry) {
           final peerId = entry.key;
           final friendCode = entry.value;
 
+          debugPrint('Friend code discovered: $friendCode from peer $peerId');
+
           // Check if this friend code matches any of our friends
           if (isFriend(friendCode)) {
+            debugPrint('Friend $friendCode is online!');
             updateFriendOnlineStatus(
               friendCode,
               isOnline: true,
@@ -127,53 +134,60 @@ class FriendService extends ChangeNotifier {
         });
 
     // Listen for incoming friend requests (auto-add)
+    _friendRequestSubscription?.cancel();
     _friendRequestSubscription = meshService.friendRequestStream.listen((
       entry,
     ) async {
       final nickname = entry.key;
       final friendCode = entry.value;
 
+      debugPrint('Received friend request: $friendCode ($nickname)');
+
       // Auto-add if not already a friend
       if (!isFriend(friendCode) && friendCode != _myFriendCode) {
         debugPrint('Auto-adding friend from request: $friendCode ($nickname)');
         await addFriend(friendCode, nickname: nickname, isAutoAdd: true);
+      } else if (isFriend(friendCode)) {
+        // Already a friend, just update their status
+        updateFriendOnlineStatus(
+          friendCode,
+          isOnline: true,
+          detectedNickname: nickname,
+        );
+      }
+    });
+
+    // Also listen to general peer discovery for any friends
+    _peerDiscoverySubscription?.cancel();
+    _peerDiscoverySubscription = meshService.peerDiscoveryStream.listen((peer) {
+      // Check if we know this peer's friend code
+      final friendCode = meshService.getFriendCodeForPeer(peer.id);
+      if (friendCode != null && isFriend(friendCode)) {
+        updateFriendOnlineStatus(
+          friendCode,
+          isOnline: true,
+          detectedNickname: peer.nickname,
+        );
       }
     });
   }
 
-  /// Generate a 6-character friend code from peer ID
-  /// Format: ABC-123 (letters + numbers)
+  /// Generate a compact 4-character hex friend code from peer ID
+  /// Format: 3A9F (4 hex characters = 65,536 unique codes)
+  /// This is derived from the same 2-byte hash used in BLE packets
   static String generateFriendCode(String peerId) {
-    // Use a hash to generate consistent code
+    // Use same hash algorithm as BLE mesh service
     int hash = 0;
     for (int i = 0; i < peerId.length; i++) {
-      hash = ((hash << 5) - hash + peerId.codeUnitAt(i)) & 0x7FFFFFFF;
+      hash = ((hash << 5) - hash + peerId.codeUnitAt(i)) & 0xFFFF;
     }
-
-    // Generate 3 letters
-    const letters = 'ABCDEFGHJKLMNPQRSTUVWXYZ'; // No I, O (confusing)
-    String letterPart = '';
-    int temp = hash;
-    for (int i = 0; i < 3; i++) {
-      letterPart += letters[temp % letters.length];
-      temp ~/= letters.length;
-    }
-
-    // Generate 3 numbers
-    String numberPart = ((hash >> 10) % 1000).toString().padLeft(3, '0');
-
-    return '$letterPart-$numberPart';
+    return hash.toRadixString(16).padLeft(4, '0').toUpperCase();
   }
 
-  /// Get peer ID hash from friend code (for matching)
+  /// Get the 2-byte hash from friend code (for matching)
   static int friendCodeToHash(String friendCode) {
-    // Simple hash of the friend code for matching
-    int hash = 0;
-    final normalized = friendCode.toUpperCase().replaceAll('-', '');
-    for (int i = 0; i < normalized.length; i++) {
-      hash = ((hash << 5) - hash + normalized.codeUnitAt(i)) & 0xFFFF;
-    }
-    return hash;
+    // Parse hex string back to int
+    return int.tryParse(friendCode.toUpperCase(), radix: 16) ?? 0;
   }
 
   // =========================================================================
@@ -206,18 +220,23 @@ class FriendService extends ChangeNotifier {
   }) async {
     final normalizedCode = friendCode.toUpperCase().trim();
 
+    debugPrint('addFriend called: $normalizedCode (isAutoAdd: $isAutoAdd)');
+
     // Validate format (ABC-123)
     if (!_isValidFriendCode(normalizedCode)) {
+      debugPrint('Invalid friend code format: $normalizedCode');
       return false;
     }
 
     // Can't add yourself
     if (normalizedCode == _myFriendCode) {
+      debugPrint('Cannot add yourself as friend');
       return false;
     }
 
     // Already added?
     if (_friends.containsKey(normalizedCode)) {
+      debugPrint('Friend $normalizedCode already exists');
       // If already a friend, just mark them online if this is from a request
       if (isAutoAdd) {
         updateFriendOnlineStatus(
@@ -245,12 +264,17 @@ class FriendService extends ChangeNotifier {
     _friendUpdateController.add(friend);
     notifyListeners();
 
+    debugPrint(
+      'Friend $normalizedCode added successfully (total: ${_friends.length})',
+    );
+
     // If manually adding (not auto-add), broadcast a friend request
     // so the other device can auto-add us back
     if (!isAutoAdd) {
       try {
+        debugPrint('Broadcasting friend request to $normalizedCode');
         await BleMeshService.instance.broadcastFriendRequest(normalizedCode);
-        debugPrint('Sent friend request to $normalizedCode');
+        debugPrint('Friend request queued for $normalizedCode');
       } catch (e) {
         debugPrint('Failed to broadcast friend request: $e');
       }
@@ -315,6 +339,9 @@ class FriendService extends ChangeNotifier {
       }
 
       if (wasOnline != isOnline) {
+        debugPrint(
+          'Friend ${friend.nickname} ($friendCode) is now ${isOnline ? "ONLINE" : "OFFLINE"}',
+        );
         _friendUpdateController.add(friend);
         notifyListeners();
       }
@@ -491,8 +518,8 @@ class FriendService extends ChangeNotifier {
   // =========================================================================
 
   bool _isValidFriendCode(String code) {
-    // Format: ABC-123 (3 letters, dash, 3 numbers)
-    final regex = RegExp(r'^[A-Z]{3}-[0-9]{3}$');
+    // Format: 4 hex characters (0-9, A-F)
+    final regex = RegExp(r'^[0-9A-F]{4}$', caseSensitive: false);
     return regex.hasMatch(code);
   }
 
@@ -501,6 +528,7 @@ class FriendService extends ChangeNotifier {
   void dispose() {
     _friendCodeDiscoverySubscription?.cancel();
     _friendRequestSubscription?.cancel();
+    _peerDiscoverySubscription?.cancel();
     _staleCheckTimer?.cancel();
     _friendUpdateController.close();
     _messageController.close();

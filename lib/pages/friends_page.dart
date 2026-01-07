@@ -477,7 +477,7 @@ class _FriendsPageState extends State<FriendsPage> {
               ),
               const SizedBox(height: 8),
               Text(
-                'Enter your friend\'s code (e.g., ABC-123)',
+                'Enter your friend\'s 4-character code (e.g., 3A9F)',
                 style: TextStyle(color: textLight, fontSize: 14),
               ),
               const SizedBox(height: 20),
@@ -487,7 +487,7 @@ class _FriendsPageState extends State<FriendsPage> {
                 controller: _addFriendController,
                 decoration: InputDecoration(
                   labelText: 'Friend Code',
-                  hintText: 'ABC-123',
+                  hintText: '3A9F',
                   filled: true,
                   fillColor: bgLight,
                   border: OutlineInputBorder(
@@ -498,9 +498,8 @@ class _FriendsPageState extends State<FriendsPage> {
                 ),
                 textCapitalization: TextCapitalization.characters,
                 inputFormatters: [
-                  FilteringTextInputFormatter.allow(RegExp(r'[A-Za-z0-9\-]')),
-                  LengthLimitingTextInputFormatter(7),
-                  _FriendCodeFormatter(),
+                  FilteringTextInputFormatter.allow(RegExp(r'[A-Fa-f0-9]')),
+                  LengthLimitingTextInputFormatter(4),
                 ],
               ),
 
@@ -563,10 +562,12 @@ class _FriendsPageState extends State<FriendsPage> {
       return;
     }
 
-    // Validate format
-    if (!RegExp(r'^[A-Z]{3}-[0-9]{3}$').hasMatch(code)) {
+    // Validate format (4 hex characters)
+    if (!RegExp(r'^[0-9A-F]{4}$').hasMatch(code)) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Invalid code format. Use ABC-123')),
+        const SnackBar(
+          content: Text('Invalid code. Use 4 hex characters (e.g., 3A9F)'),
+        ),
       );
       return;
     }
@@ -691,30 +692,6 @@ class _FriendsPageState extends State<FriendsPage> {
       return '${diff.inHours}h ago';
     } else {
       return '${diff.inDays}d ago';
-    }
-  }
-}
-
-/// Formatter for friend codes (auto-insert dash)
-class _FriendCodeFormatter extends TextInputFormatter {
-  @override
-  TextEditingValue formatEditUpdate(
-    TextEditingValue oldValue,
-    TextEditingValue newValue,
-  ) {
-    final text = newValue.text.toUpperCase().replaceAll('-', '');
-
-    if (text.length <= 3) {
-      return TextEditingValue(
-        text: text,
-        selection: TextSelection.collapsed(offset: text.length),
-      );
-    } else {
-      final formatted = '${text.substring(0, 3)}-${text.substring(3)}';
-      return TextEditingValue(
-        text: formatted,
-        selection: TextSelection.collapsed(offset: formatted.length),
-      );
     }
   }
 }

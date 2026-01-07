@@ -40,6 +40,21 @@ const Duration MESSAGE_CACHE_EXPIRY = Duration(minutes: 5);
 /// When to consider a peer stale/offline
 const Duration PEER_TIMEOUT = Duration(seconds: 60);
 
+/// Minimum announcement interval (randomized between MIN and MAX)
+const int MIN_ANNOUNCE_INTERVAL_MS = 4000;
+
+/// Maximum announcement interval
+const int MAX_ANNOUNCE_INTERVAL_MS = 7000;
+
+/// Broadcast duration in milliseconds
+const int BROADCAST_DURATION_MS = 1500;
+
+/// Number of times to retry friend requests
+const int FRIEND_REQUEST_RETRY_COUNT = 5;
+
+/// Delay between friend request retries (ms)
+const int FRIEND_REQUEST_RETRY_DELAY_MS = 3000;
+
 /// Maximum message length for BLE advertising (legacy limit is 31 bytes total)
 /// Structure: Type(1) + TTL(1) + MsgID(2) + SenderID(2) + Timestamp(4) + Lat(4) + Lon(4) + Payload
 /// Header = 18 bytes, manufacturer data overhead = ~4 bytes
@@ -188,6 +203,55 @@ class MeshMessage {
 }
 
 // ============================================================================
+// Raw Packet Debug Model
+// ============================================================================
+
+/// Debug information about a raw BLE packet
+class RawPacketDebug {
+  final DateTime timestamp;
+  final Uint8List rawBytes;
+  final String hexString;
+  final int? messageType;
+  final String? messageTypeName;
+  final int? ttl;
+  final int? senderIdHash;
+  final int? messageIdHash;
+  final String? payload;
+  final bool isDuplicate;
+  final bool isFromSelf;
+  final String? error;
+
+  RawPacketDebug({
+    required this.timestamp,
+    required this.rawBytes,
+    required this.hexString,
+    this.messageType,
+    this.messageTypeName,
+    this.ttl,
+    this.senderIdHash,
+    this.messageIdHash,
+    this.payload,
+    this.isDuplicate = false,
+    this.isFromSelf = false,
+    this.error,
+  });
+
+  Map<String, dynamic> toMap() => {
+    'timestamp': timestamp.toIso8601String(),
+    'size': rawBytes.length,
+    'hex': hexString,
+    'type': messageTypeName ?? 'unknown ($messageType)',
+    'ttl': ttl,
+    'senderHash': senderIdHash?.toRadixString(16).padLeft(4, '0'),
+    'msgIdHash': messageIdHash?.toRadixString(16).padLeft(4, '0'),
+    'payload': payload,
+    'isDuplicate': isDuplicate,
+    'isFromSelf': isFromSelf,
+    if (error != null) 'error': error,
+  };
+}
+
+// ============================================================================
 // BLE Mesh Service - Core Service
 // ============================================================================
 
@@ -248,6 +312,34 @@ class BleMeshService extends ChangeNotifier {
   /// Last relay time per message for flood prevention
   final Map<String, DateTime> _lastRelayTime = {};
 
+  // ---------------------------------------------------------------------------
+  // Protocol Enhancement: Anti-Ping-Pong & Collision Prevention
+  // ---------------------------------------------------------------------------
+
+  /// Sequence number for outgoing packets (increments each transmission)
+  int _sequenceNumber = 0;
+
+  /// Last seen sequence number per sender (senderIdHash -> seqNum)
+  /// Used to detect and ignore old/duplicate packets from same sender
+  final Map<int, int> _lastSeenSequence = {};
+
+  /// Last announcement time per sender (senderIdHash -> timestamp)
+  /// Used to suppress rapid announcements from same peer (cooldown)
+  final Map<int, DateTime> _lastAnnouncementTime = {};
+
+  /// Minimum time between processing announcements from same peer
+  static const Duration _announcementCooldown = Duration(seconds: 3);
+
+  /// Hop-0 peers (direct neighbors we heard from without relay)
+  /// These peers don't need their announcements relayed
+  final Set<int> _directNeighbors = {};
+
+  /// Pending friend requests to retry (targetFriendCode -> remaining retries)
+  final Map<String, int> _pendingFriendRequests = {};
+
+  /// Random instance for jitter
+  final Random _random = Random();
+
   /// Queue of messages waiting to be relayed
   final List<Uint8List> _relayQueue = [];
 
@@ -266,6 +358,8 @@ class BleMeshService extends ChangeNotifier {
   Timer? _cacheCleanupTimer;
   Timer? _relayProcessingTimer;
   Timer? _announcementTimer;
+  Timer? _friendRequestRetryTimer;
+  Timer? _scanRestartTimer;
 
   // -------------------------------------------------------------------------
   // Streams
@@ -278,6 +372,7 @@ class BleMeshService extends ChangeNotifier {
       StreamController<MapEntry<String, String>>.broadcast();
   final _friendRequestController =
       StreamController<MapEntry<String, String>>.broadcast();
+  final _rawPacketController = StreamController<RawPacketDebug>.broadcast();
   final _statusController = StreamController<String>.broadcast();
   final _errorController = StreamController<String>.broadcast();
 
@@ -293,6 +388,10 @@ class BleMeshService extends ChangeNotifier {
   /// Stream of (nickname, friendCode) when someone sends us a friend request
   Stream<MapEntry<String, String>> get friendRequestStream =>
       _friendRequestController.stream;
+
+  /// Stream of raw packets for debugging
+  Stream<RawPacketDebug> get rawPacketStream => _rawPacketController.stream;
+
   Stream<String> get statusStream => _statusController.stream;
   Stream<String> get errorStream => _errorController.stream;
 
@@ -397,8 +496,12 @@ class BleMeshService extends ChangeNotifier {
     _isScanning = true;
 
     try {
-      // Start continuous scanning
-      await FlutterBluePlus.startScan(timeout: const Duration(seconds: 30));
+      // Start with shorter timeout for more responsive restarts
+      // This allows scanning to be more continuous
+      await FlutterBluePlus.startScan(
+        timeout: const Duration(seconds: 10),
+        androidScanMode: AndroidScanMode.lowLatency, // Faster discovery
+      );
 
       // Listen to scan results
       _scanSubscription = FlutterBluePlus.scanResults.listen(
@@ -409,10 +512,14 @@ class BleMeshService extends ChangeNotifier {
         },
       );
 
-      // Restart scanning when it stops
+      // Restart scanning when it stops - faster restart
       FlutterBluePlus.isScanning.listen((scanning) {
         if (!scanning && _isScanning) {
-          Future.delayed(const Duration(seconds: 2), () {
+          // Cancel previous restart timer to avoid duplicates
+          _scanRestartTimer?.cancel();
+          // Quick restart with small random delay to avoid sync
+          final delay = 500 + _random.nextInt(500);
+          _scanRestartTimer = Timer(Duration(milliseconds: delay), () {
             if (_isScanning) _restartScanning();
           });
         }
@@ -425,9 +532,17 @@ class BleMeshService extends ChangeNotifier {
 
   Future<void> _restartScanning() async {
     try {
-      await FlutterBluePlus.startScan(timeout: const Duration(seconds: 30));
+      await FlutterBluePlus.startScan(
+        timeout: const Duration(seconds: 10),
+        androidScanMode: AndroidScanMode.lowLatency,
+      );
+      debugPrint("Scan restarted successfully");
     } catch (e) {
       debugPrint("Failed to restart scanning: $e");
+      // Try again with delay
+      Future.delayed(const Duration(seconds: 1), () {
+        if (_isScanning) _restartScanning();
+      });
     }
   }
 
@@ -470,7 +585,21 @@ class BleMeshService extends ChangeNotifier {
   /// - Timestamp: 4 bytes (seconds)
   /// - Payload: remaining bytes
   void _handleIncomingPacket(Uint8List data) {
-    if (data.length < 12) return; // Minimum header size
+    if (data.length < 12) {
+      // Emit debug info for too-short packet
+      _rawPacketController.add(
+        RawPacketDebug(
+          timestamp: DateTime.now(),
+          rawBytes: data,
+          hexString: _bytesToHex(data),
+          error: 'Packet too short (${data.length} bytes, need 12+)',
+        ),
+      );
+      return;
+    }
+
+    // Build hex string for debug
+    final hexString = _bytesToHex(data);
 
     try {
       int offset = 0;
@@ -478,7 +607,18 @@ class BleMeshService extends ChangeNotifier {
       // Parse message type
       final typeValue = data[offset++];
       final type = MeshMessageType.fromValue(typeValue);
-      if (type == null) return;
+      if (type == null) {
+        _rawPacketController.add(
+          RawPacketDebug(
+            timestamp: DateTime.now(),
+            rawBytes: data,
+            hexString: hexString,
+            messageType: typeValue,
+            error: 'Unknown message type: $typeValue',
+          ),
+        );
+        return;
+      }
 
       // Parse TTL
       final ttl = data[offset++];
@@ -488,18 +628,83 @@ class BleMeshService extends ChangeNotifier {
       offset += 2;
       final messageId = 'h:$msgIdHash'; // Use hash as ID
 
-      // Deduplication check
-      if (_processedMessageIds.containsKey(messageId)) return;
-      _processedMessageIds[messageId] = DateTime.now();
-
       // Parse 2-byte sender ID hash
       final senderIdHash = (data[offset] << 8) | data[offset + 1];
       offset += 2;
       final senderId = senderIdHash.toRadixString(16).padLeft(4, '0');
 
-      // Skip our own messages (compare hash)
+      // Parse payload for debug
+      String? payloadPreview;
+      try {
+        if (data.length > offset + 12) {
+          payloadPreview = utf8.decode(
+            data.sublist(offset + 12),
+            allowMalformed: true,
+          );
+        } else if (data.length > offset) {
+          payloadPreview = utf8.decode(
+            data.sublist(offset),
+            allowMalformed: true,
+          );
+        }
+      } catch (_) {}
+
+      // Check for duplicate
+      final isDuplicate = _processedMessageIds.containsKey(messageId);
+
+      // Check if from self
       final myIdHash = _hashTo2Bytes(_peerId!);
-      if (senderIdHash == myIdHash) return;
+      final isFromSelf = senderIdHash == myIdHash;
+
+      // Emit raw packet debug info
+      _rawPacketController.add(
+        RawPacketDebug(
+          timestamp: DateTime.now(),
+          rawBytes: data,
+          hexString: hexString,
+          messageType: typeValue,
+          messageTypeName: type.name,
+          ttl: ttl,
+          senderIdHash: senderIdHash,
+          messageIdHash: msgIdHash,
+          payload: payloadPreview,
+          isDuplicate: isDuplicate,
+          isFromSelf: isFromSelf,
+        ),
+      );
+
+      // Deduplication check
+      if (isDuplicate) return;
+      _processedMessageIds[messageId] = DateTime.now();
+
+      // Skip our own messages (compare hash)
+      if (isFromSelf) return;
+
+      // Calculate hop count early for neighbor detection
+      final hopCount = DEFAULT_TTL - ttl;
+
+      // Track direct neighbors (hop-0 = heard directly, not relayed)
+      if (hopCount == 0) {
+        _directNeighbors.add(senderIdHash);
+      }
+
+      // === PROTOCOL: Announcement Cooldown ===
+      // For announcements, apply per-sender cooldown to prevent rapid ping-pong
+      if (type == MeshMessageType.announce) {
+        final lastAnnounce = _lastAnnouncementTime[senderIdHash];
+        if (lastAnnounce != null) {
+          final elapsed = DateTime.now().difference(lastAnnounce);
+          if (elapsed < _announcementCooldown) {
+            // Skip this announcement, we recently processed one from this sender
+            debugPrint(
+              'PROTOCOL: Skipping announcement from 0x${senderIdHash.toRadixString(16)} - cooldown (${elapsed.inMilliseconds}ms < ${_announcementCooldown.inMilliseconds}ms)',
+            );
+            return;
+          }
+        }
+        // Update last announcement time for this sender
+        _lastAnnouncementTime[senderIdHash] = DateTime.now();
+      }
 
       // Handle direct messages and friend requests (same packet format)
       if (type == MeshMessageType.direct ||
@@ -537,8 +742,7 @@ class BleMeshService extends ChangeNotifier {
       offset += 4;
       final double? longitude = lonFloat.isNaN ? null : lonFloat;
 
-      // Calculate hop count
-      final hopCount = DEFAULT_TTL - ttl;
+      // hopCount already calculated above for neighbor detection
 
       // Update or create peer and emit discovery event
       final isNewPeer = !peers.containsKey(senderId);
@@ -608,16 +812,39 @@ class BleMeshService extends ChangeNotifier {
           }
         }
 
+        debugPrint(
+          'Discovered peer: $nickname ($friendCode) - ${peers.length} total peers',
+        );
+
         // Emit peer discovery with friend code info
         if (friendCode != null) {
           _friendCodeDiscoveryController.add(MapEntry(senderId, friendCode));
+
+          // If we have a pending friend request to this person, they're now reachable
+          if (hasPendingFriendRequest(friendCode)) {
+            debugPrint(
+              'Friend $friendCode is now reachable, will retry request',
+            );
+          }
         }
 
         notifyListeners();
 
-        // Relay announcements too
-        if (ttl > 0) {
+        // === PROTOCOL: Smart Announcement Relay ===
+        // Only relay announcements if:
+        // 1. TTL > 0 (has hops remaining)
+        // 2. hopCount > 0 (NOT from a direct neighbor - they broadcast themselves)
+        // 3. hopCount < 3 (limit relay depth for announcements)
+        // This prevents the ping-pong effect in 2-device scenarios
+        if (ttl > 0 && hopCount > 0 && hopCount < 3) {
+          debugPrint(
+            'PROTOCOL: Relaying announcement from 0x${senderIdHash.toRadixString(16)} (hop $hopCount)',
+          );
           _scheduleRelay(data, ttl, messageId);
+        } else if (hopCount == 0) {
+          debugPrint(
+            'PROTOCOL: NOT relaying announcement from direct neighbor 0x${senderIdHash.toRadixString(16)}',
+          );
         }
       }
     } catch (e) {
@@ -674,8 +901,9 @@ class BleMeshService extends ChangeNotifier {
       }
 
       // Check if this message is for us
-      final myFriendCodeHash = _hashTo2Bytes(_generateFriendCode(_peerId!));
-      final isForMe = targetIdHash == myFriendCodeHash;
+      // My friend code is just my peer ID hash, so compare directly
+      final myPeerIdHash = _hashTo2Bytes(_peerId!);
+      final isForMe = targetIdHash == myPeerIdHash;
 
       if (isForMe) {
         if (type == MeshMessageType.friendRequest) {
@@ -700,6 +928,13 @@ class BleMeshService extends ChangeNotifier {
             // Also store this peer's friend code
             _peerFriendCodes[senderId] = senderFriendCode;
             peers[senderId]?.nickname = senderNickname;
+
+            // If we had a pending request to them, cancel it (mutual add)
+            cancelPendingFriendRequest(senderFriendCode);
+
+            debugPrint(
+              'Received friend request from $senderFriendCode ($senderNickname)',
+            );
           }
         } else {
           // Regular direct message
@@ -733,13 +968,12 @@ class BleMeshService extends ChangeNotifier {
     }
   }
 
-  /// Generate friend code from peer ID (same algorithm as FriendService)
+  /// Generate friend code from peer ID (MUST match FriendService.generateFriendCode)
+  /// Format: 4 hex characters (e.g., "3A9F") - compact for BLE payload
   String _generateFriendCode(String peerId) {
-    // Use first 3 chars of hex hash + last 3 digits
-    final hash = _hashTo2Bytes(
-      peerId,
-    ).toRadixString(16).padLeft(4, '0').toUpperCase();
-    return '${hash.substring(0, 3)}-${hash.substring(1, 4)}';
+    // Use same 2-byte hash that's used for sender ID
+    final hash = _hashTo2Bytes(peerId);
+    return hash.toRadixString(16).padLeft(4, '0').toUpperCase();
   }
 
   /// Schedule a message for relay
@@ -872,7 +1106,11 @@ class BleMeshService extends ChangeNotifier {
 
     final msgIdHash = _hashTo2Bytes(messageId);
     final senderIdHash = _hashTo2Bytes(_peerId!);
-    final targetIdHash = _hashTo2Bytes(targetFriendCode);
+
+    // Friend code IS the hex representation of the hash, parse it back
+    final targetIdHash =
+        int.tryParse(targetFriendCode.toUpperCase(), radix: 16) ?? 0;
+
     final timestampSecs = DateTime.now().millisecondsSinceEpoch ~/ 1000;
 
     // More space for text since no lat/lon
@@ -924,7 +1162,25 @@ class BleMeshService extends ChangeNotifier {
 
   /// Broadcast a friend request to a specific user
   /// Called when you add someone as a friend
+  ///
+  /// This queues the request for multiple retries to ensure delivery
   Future<void> broadcastFriendRequest(String targetFriendCode) async {
+    if (_peerId == null || _nickname == null) return;
+
+    // Queue for retries (will be sent multiple times)
+    _pendingFriendRequests[targetFriendCode] = FRIEND_REQUEST_RETRY_COUNT;
+
+    // Send immediately first time
+    await _sendFriendRequestInternal(targetFriendCode);
+    _pendingFriendRequests[targetFriendCode] = FRIEND_REQUEST_RETRY_COUNT - 1;
+
+    debugPrint(
+      'Queued friend request to $targetFriendCode for ${FRIEND_REQUEST_RETRY_COUNT} retries',
+    );
+  }
+
+  /// Internal method to send a friend request packet
+  Future<void> _sendFriendRequestInternal(String targetFriendCode) async {
     if (_peerId == null || _nickname == null) return;
 
     // Content: "myNickname|myFriendCode"
@@ -937,6 +1193,16 @@ class BleMeshService extends ChangeNotifier {
       targetFriendCode: targetFriendCode,
     );
     await _broadcast(packet);
+  }
+
+  /// Cancel pending friend requests for a target
+  void cancelPendingFriendRequest(String targetFriendCode) {
+    _pendingFriendRequests.remove(targetFriendCode);
+  }
+
+  /// Check if a friend request is pending for a target
+  bool hasPendingFriendRequest(String targetFriendCode) {
+    return _pendingFriendRequests.containsKey(targetFriendCode);
   }
 
   /// Build a mesh packet with compact format
@@ -1020,12 +1286,15 @@ class BleMeshService extends ChangeNotifier {
     return hash;
   }
 
-  /// Broadcast a packet via BLE advertising
-  Future<void> _broadcast(Uint8List packet) async {
+  /// Broadcast a packet via BLE advertising with anti-collision
+  ///
+  /// Uses short broadcast windows and randomized timing to prevent
+  /// two devices from consistently overlapping
+  Future<bool> _broadcast(Uint8List packet) async {
     // Skip if already broadcasting (prevents race conditions)
     if (_advertisingBusy) {
       debugPrint("Skipping broadcast - already busy");
-      return;
+      return false;
     }
     _advertisingBusy = true;
 
@@ -1042,6 +1311,10 @@ class BleMeshService extends ChangeNotifier {
         await Future.delayed(const Duration(milliseconds: 150));
       }
 
+      // Add random pre-broadcast jitter (0-200ms) to desync from other devices
+      final preJitter = _random.nextInt(200);
+      await Future.delayed(Duration(milliseconds: preJitter));
+
       final advertiseData = AdvertiseData(
         manufacturerId: MESH_MANUFACTURER_ID,
         manufacturerData: packet,
@@ -1052,9 +1325,9 @@ class BleMeshService extends ChangeNotifier {
       _isAdvertising = true;
       _statusController.add("Broadcasting...");
 
-      // Schedule stop after 2 seconds (shorter than the 5s interval)
-      await Future.delayed(const Duration(seconds: 2));
-      
+      // Shorter broadcast window (1.5s) to allow more scan time
+      await Future.delayed(const Duration(milliseconds: BROADCAST_DURATION_MS));
+
       if (_isAdvertising) {
         try {
           await _blePeripheral.stop();
@@ -1064,9 +1337,11 @@ class BleMeshService extends ChangeNotifier {
           debugPrint("Error stopping broadcast: $e");
         }
       }
+      return true;
     } catch (e) {
       _isAdvertising = false;
       _errorController.add("Broadcast failed: $e");
+      return false;
     } finally {
       _advertisingBusy = false;
     }
@@ -1089,11 +1364,58 @@ class BleMeshService extends ChangeNotifier {
       _processRelayQueue();
     });
 
-      // Periodic announcements every 5 seconds for friend presence detection
-    // (2s broadcast + 3s gap to avoid race conditions)
-    _announcementTimer = Timer.periodic(const Duration(seconds: 5), (_) {
-      announcePresence();
+    // Randomized announcement scheduling to prevent collision
+    _scheduleNextAnnouncement();
+
+    // Friend request retry timer (every 3 seconds)
+    _friendRequestRetryTimer = Timer.periodic(
+      const Duration(milliseconds: FRIEND_REQUEST_RETRY_DELAY_MS),
+      (_) => _processPendingFriendRequests(),
+    );
+  }
+
+  /// Schedule next announcement with random interval
+  void _scheduleNextAnnouncement() {
+    // Random interval between MIN and MAX to avoid sync with other devices
+    final intervalMs =
+        MIN_ANNOUNCE_INTERVAL_MS +
+        _random.nextInt(MAX_ANNOUNCE_INTERVAL_MS - MIN_ANNOUNCE_INTERVAL_MS);
+
+    _announcementTimer?.cancel();
+    _announcementTimer = Timer(Duration(milliseconds: intervalMs), () async {
+      await announcePresence();
+      // Schedule next one
+      _scheduleNextAnnouncement();
     });
+  }
+
+  /// Process pending friend requests (retry mechanism)
+  Future<void> _processPendingFriendRequests() async {
+    if (_pendingFriendRequests.isEmpty || _advertisingBusy) return;
+
+    // Get one pending request to process
+    final entries = _pendingFriendRequests.entries.toList();
+    if (entries.isEmpty) return;
+
+    for (final entry in entries) {
+      final targetFriendCode = entry.key;
+      final retriesLeft = entry.value;
+
+      if (retriesLeft <= 0) {
+        _pendingFriendRequests.remove(targetFriendCode);
+        continue;
+      }
+
+      // Send the friend request
+      debugPrint(
+        'Retrying friend request to $targetFriendCode (${retriesLeft} left)',
+      );
+      await _sendFriendRequestInternal(targetFriendCode);
+      _pendingFriendRequests[targetFriendCode] = retriesLeft - 1;
+
+      // Only process one per cycle to avoid flooding
+      break;
+    }
   }
 
   void _cleanupCaches() {
@@ -1108,6 +1430,15 @@ class BleMeshService extends ChangeNotifier {
     _lastRelayTime.removeWhere((_, timestamp) {
       return now.difference(timestamp) > MESSAGE_CACHE_EXPIRY;
     });
+
+    // Cleanup old announcement cooldown times
+    _lastAnnouncementTime.removeWhere((_, timestamp) {
+      return now.difference(timestamp) > const Duration(minutes: 2);
+    });
+
+    // Cleanup stale direct neighbors (if we haven't heard from them in 2 minutes)
+    // Note: This is a simple cleanup; directNeighbors set is refreshed on each packet
+    // We keep it to avoid memory growth but it's reset naturally
 
     // Cleanup stale peers
     final stalePeers = peers.entries
@@ -1159,6 +1490,11 @@ class BleMeshService extends ChangeNotifier {
   // =========================================================================
   // Utilities
   // =========================================================================
+
+  /// Convert bytes to hex string for debugging
+  String _bytesToHex(Uint8List bytes) {
+    return bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ');
+  }
 
   Uint8List _hexToBytes(String hex) {
     var h = hex;
@@ -1215,9 +1551,12 @@ class BleMeshService extends ChangeNotifier {
     _cacheCleanupTimer?.cancel();
     _relayProcessingTimer?.cancel();
     _announcementTimer?.cancel();
+    _friendRequestRetryTimer?.cancel();
+    _scanRestartTimer?.cancel();
     _scanSubscription?.cancel();
 
     _relayQueue.clear();
+    _pendingFriendRequests.clear();
 
     try {
       await _blePeripheral.stop();
@@ -1231,6 +1570,7 @@ class BleMeshService extends ChangeNotifier {
     _peerDiscoveryController.close();
     _friendCodeDiscoveryController.close();
     _friendRequestController.close();
+    _rawPacketController.close();
     _statusController.close();
     _errorController.close();
   }
